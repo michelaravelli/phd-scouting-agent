@@ -1,0 +1,31 @@
+name: PhD Scouting Agent
+
+on:
+  schedule:
+    # Ogni martedì e venerdì alle 07:00 UTC (~09:00 ora italiana in inverno, 08:00/09:00 in estate)
+    - cron: "0 7 * * 2,5"
+  workflow_dispatch: {}   # permette di lanciarlo a mano dal tab "Actions" per i test
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scouting script
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOTION_DB_FONTI_ID: ${{ secrets.NOTION_DB_FONTI_ID }}
+          NOTION_DB_TRACKER_ID: ${{ secrets.NOTION_DB_TRACKER_ID }}
+        run: python scout.py
