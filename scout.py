@@ -23,6 +23,7 @@ import hashlib
 import datetime
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -55,6 +56,14 @@ TIPO_OPZIONI = [
     "Evento gratuito online",
     "Lezione/Seminario",
 ]
+
+# Parole chiave usate per riconoscere, tra i link della pagina principale di una
+# fonte, quelli che probabilmente portano a call for papers / news / annunci.
+LINK_KEYWORDS = [
+    "call", "cfp", "news", "announce", "deadline", "papers",
+    "submission", "event", "conference", "bando", "scadenza", "convegn",
+]
+MAX_SUBLINKS_PER_FONTE = 5
 
 
 # ---------------------------------------------------------------------------
@@ -133,20 +142,79 @@ def create_tracker_entry(item, fonte_url, found_iso_date):
 
 
 # ---------------------------------------------------------------------------
-# Fetch & hash della pagina fonte
+# Fetch & hash della pagina fonte (+ eventuali sottopagine collegate)
 # ---------------------------------------------------------------------------
 
-def fetch_page_text(url):
-    """Scarica una pagina e ne estrae il testo visibile, ripulito."""
+def fetch_html(url):
+    """Scarica l'HTML grezzo di una pagina."""
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    return resp.text
+
+
+def extract_text_from_html(html):
+    """Estrae il testo visibile e ripulito da un HTML grezzo."""
+    soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
     text = re.sub(r"\n{2,}", "\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+def extract_relevant_links(base_url, html, max_links=MAX_SUBLINKS_PER_FONTE):
+    """Trova, tra i link della pagina, quelli che sembrano portare a
+    call for papers / news / annunci, restando sullo stesso dominio."""
+    soup = BeautifulSoup(html, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    found, seen = [], set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        label = (a.get_text() or "").lower()
+        haystack = f"{href} {label}".lower()
+        if not any(k in haystack for k in LINK_KEYWORDS):
+            continue
+
+        abs_url = urljoin(base_url, href)
+        parsed = urlparse(abs_url)
+        if parsed.netloc != base_domain:
+            continue  # niente link verso altri siti
+        if abs_url in seen or abs_url.rstrip("/") == base_url.rstrip("/"):
+            continue
+
+        seen.add(abs_url)
+        found.append(abs_url)
+        if len(found) >= max_links:
+            break
+
+    return found
+
+
+def fetch_source_text(url):
+    """Scarica la pagina principale di una fonte + fino a
+    MAX_SUBLINKS_PER_FONTE sottopagine collegate rilevanti (call/news/cfp...),
+    e restituisce tutto come un unico blocco di testo."""
+    main_html = fetch_html(url)
+    combined = extract_text_from_html(main_html)
+
+    try:
+        sublinks = extract_relevant_links(url, main_html)
+    except Exception as e:
+        print(f"  [!] Errore estraendo i link interni: {e}")
+        sublinks = []
+
+    for link in sublinks:
+        try:
+            sub_html = fetch_html(link)
+            sub_text = extract_text_from_html(sub_html)
+            combined += f"\n\n--- Pagina collegata: {link} ---\n{sub_text}"
+            print(f"  (+) sottopagina controllata: {link}")
+        except Exception as e:
+            print(f"  [!] Errore nel fetch della sottopagina {link}: {e}")
+
+    return combined
 
 
 def hash_text(text):
@@ -189,7 +257,7 @@ TESTO DELLA PAGINA:
 
 def ask_gemini(nome_fonte, url_fonte, text):
     prompt = PROMPT_TEMPLATE.format(
-        nome_fonte=nome_fonte, url_fonte=url_fonte, testo=text[:15000]
+        nome_fonte=nome_fonte, url_fonte=url_fonte, testo=text[:20000]
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -233,7 +301,7 @@ def main():
 
         print(f"- {nome}: controllo {url}")
         try:
-            text = fetch_page_text(url)
+            text = fetch_source_text(url)
         except Exception as e:
             print(f"  [!] Errore nel fetch: {e}")
             continue
