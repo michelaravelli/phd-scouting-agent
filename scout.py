@@ -1,7 +1,8 @@
 """
-PhD Scouting Agent (v2.1)
+PhD Scouting Agent (v2.2)
 ------------------------
-Versione corretta:
+Versione corretta e sanificata:
+  - Pulizia automatica delle variabili d'ambiente (clean_env_var) per rimuovere syntax markdown/parentesi casuali dai Secret.
   - Gestione pulita del JSON restituito da Gemini (rimozione blocchi markdown ```json).
   - User-Agent aggiornato per bypassare blocchi HTTP 403/405 su Wiley, Sage e DeGruyter.
   - Aggiunta opzione CLI `--force` per forzare la ri-analisi di Gemini bypassando il controllo hash.
@@ -19,11 +20,22 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-DB_FONTI_ID = os.environ["NOTION_DB_FONTI_ID"]
-DB_TRACKER_ID = os.environ["NOTION_DB_TRACKER_ID"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+def clean_env_var(val, default=""):
+    """Rimuove formattazione markdown, parentesi e spazi accidentali dai Secret/Variables."""
+    if not val:
+        return default
+    cleaned = re.sub(r"\[.*?\]\((.*?)\)", r"\1", val)
+    cleaned = cleaned.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
+    return cleaned.strip()
+
+
+# Configurazione e Sanitizzazione delle Variabili d'Ambiente
+NOTION_TOKEN = clean_env_var(os.environ.get("NOTION_TOKEN"))
+GEMINI_API_KEY = clean_env_var(os.environ.get("GEMINI_API_KEY"))
+DB_FONTI_ID = clean_env_var(os.environ.get("NOTION_DB_FONTI_ID"))
+DB_TRACKER_ID = clean_env_var(os.environ.get("NOTION_DB_TRACKER_ID"))
+GEMINI_MODEL = clean_env_var(os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash-lite")
 
 NOTION_API = "[https://api.notion.com/v1](https://api.notion.com/v1)"
 NOTION_HEADERS = {
@@ -36,7 +48,7 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-# User-Agent browser standard per mitigare 403/405 su DeGruyter, Wiley, Sage
+# User-Agent browser standard per mitigare 403/405
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -86,7 +98,7 @@ GEMINI_BACKOFF_BASE_SEC = 15
 _last_gemini_call_ts = 0.0
 
 # ---------------------------------------------------------------------------
-# Notion helpers - Fonti
+# Notion Helpers - Fonti
 # ---------------------------------------------------------------------------
 
 def notion_query_active_fonti():
@@ -146,7 +158,7 @@ def update_fonte_status(page_id, hash_map, checked_iso_date):
     resp.raise_for_status()
 
 # ---------------------------------------------------------------------------
-# Notion helpers - Tracker
+# Notion Helpers - Tracker
 # ---------------------------------------------------------------------------
 
 def notion_query_all_tracker_keys():
@@ -209,7 +221,7 @@ def create_tracker_entry(item, fonte_url):
     resp.raise_for_status()
 
 # ---------------------------------------------------------------------------
-# Fetch, parsing e crawling
+# Scraping e Crawling
 # ---------------------------------------------------------------------------
 
 def fetch_html(url):
@@ -217,7 +229,7 @@ def fetch_html(url):
     resp.raise_for_status()
     ctype = resp.headers.get("Content-Type", "")
     if "html" not in ctype.lower():
-        raise ValueError(f"contenuto non HTML ({ctype}), salto")
+        raise ValueError(f"Contenuto non HTML ({ctype}), salto.")
     return resp.text
 
 
@@ -291,12 +303,12 @@ def crawl_source(entry_urls):
         try:
             html = fetch_html(url)
         except Exception as e:
-            print(f"    [!] fetch fallito per {url}: {e}")
+            print(f"    [!] Fetch fallito per {url}: {e}")
             continue
 
         text = extract_text_from_html(html)
         pages[url] = text[:MAX_CHARS_PER_PAGE]
-        print(f"    (+) pagina letta: {url}")
+        print(f"    (+) Pagina letta: {url}")
 
         if depth >= MAX_DEPTH or len(pages) >= MAX_PAGES_PER_FONTE:
             continue
@@ -307,7 +319,7 @@ def crawl_source(entry_urls):
         try:
             candidates = extract_candidate_links(url, html, use_weak_keywords=use_weak)
         except Exception as e:
-            print(f"    [!] errore estraendo link da {url}: {e}")
+            print(f"    [!] Errore estraendo link da {url}: {e}")
             candidates = []
 
         for link in candidates:
@@ -323,7 +335,7 @@ def crawl_source(entry_urls):
     return pages
 
 # ---------------------------------------------------------------------------
-# Gemini API Interaction
+# Interazione Gemini API
 # ---------------------------------------------------------------------------
 
 PROMPT_TEMPLATE = """Sei un assistente che aiuta un dottorando in semiotica cognitiva e filosofia della
@@ -368,7 +380,7 @@ def check_gemini_model():
             timeout=15,
         )
         if resp.status_code == 404:
-            print(f"ATTENZIONE: modello '{GEMINI_MODEL}' non valido (404).")
+            print(f"ATTENZIONE: modello '{GEMINI_MODEL}' non trovato (404).")
             return False
         resp.raise_for_status()
         print(f"Modello Gemini verificato: {GEMINI_MODEL}")
@@ -404,7 +416,7 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
         except requests.exceptions.RequestException as e:
             _last_gemini_call_ts = time.time()
             wait = GEMINI_BACKOFF_BASE_SEC * attempt
-            print(f"  [i] Errore connessione Gemini per {nome_fonte} ({attempt}/{GEMINI_MAX_RETRIES}): {e}. Retrying in {wait:.0f}s...")
+            print(f"  [i] Errore connessione Gemini per {nome_fonte} ({attempt}/{GEMINI_MAX_RETRIES}): {e}. Riprovo tra {wait:.0f}s...")
             time.sleep(wait)
             continue
 
@@ -423,7 +435,7 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
             raw = re.sub(r"^```json\s*", "", raw, flags=re.IGNORECASE)
             raw = re.sub(r"^```\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw).strip()
-            
+
             parsed = json.loads(raw)
             return parsed.get("trovate", [])
         except (KeyError, IndexError, json.JSONDecodeError) as err:
@@ -434,7 +446,7 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
     return []
 
 # ---------------------------------------------------------------------------
-# Main Execution
+# Flusso Principale
 # ---------------------------------------------------------------------------
 
 def main():
@@ -444,6 +456,7 @@ def main():
 
     today = datetime.date.today().isoformat()
     check_gemini_model()
+    
     fonti = notion_query_active_fonti()
     print(f"Fonti attive da controllare: {len(fonti)}")
 
@@ -490,7 +503,7 @@ def main():
         changed = force_run or any(new_hash_map[u] != old_hash_map.get(u) for u in new_hash_map)
 
         if not changed:
-            print("  Nessuna modifica rilevata su nessuna pagina esplorata.")
+            print("  Nessuna modifica rilevata sulle pagine esplorate.")
             try:
                 update_fonte_status(page_id, new_hash_map, today)
             except Exception as e:
@@ -499,7 +512,7 @@ def main():
 
         print("  Cambiamento rilevato (o --force), chiedo a Gemini...")
         combined_text = "\n\n".join(f"--- Pagina: {u} ---\n{t}" for u, t in pages.items())
-        
+
         trovate = ask_gemini(nome, categoria, frequenza, natura, combined_text)
 
         for item in trovate:
@@ -507,7 +520,7 @@ def main():
                 continue
             link = item.get("link") or entry_urls[0]
             if is_duplicate(existing_keys, item, link):
-                print(f"  (già presente nel Tracker, salto) {item['titolo']}")
+                print(f"  (Già presente nel Tracker, salto) {item['titolo']}")
                 continue
             try:
                 create_tracker_entry(item, entry_urls[0])
