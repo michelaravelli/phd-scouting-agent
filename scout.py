@@ -49,13 +49,18 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 DB_FONTI_ID = os.environ["NOTION_DB_FONTI_ID"]
 DB_TRACKER_ID = os.environ["NOTION_DB_TRACKER_ID"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-# Nota: "gemini-flash-latest" e' un alias mantenuto da Google che punta
-# sempre al modello Flash gratuito corrente (gemini-2.0-flash, usato nella
-# v1 di questo script, e' stato dismesso il 1 giugno 2026 e ora risponde
-# 404). Usare l'alias evita di dover aggiornare questo file ogni volta che
-# Google ritira un modello. Se preferisci fissare una versione precisa,
-# imposta GEMINI_MODEL nei secrets (es. "gemini-3-flash-preview").
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Nota: fissiamo un modello stabile invece di un alias "latest". Da dic. 2025
+# Google ha ridotto parecchio le quote gratuite; oggi (set. 2026) i modelli
+# STABILI hanno quote piu' generose dei modelli "preview" (a cui puntano gli
+# alias tipo gemini-flash-latest / gemini-3-flash-preview). gemini-2.5-flash-
+# lite e' oggi il miglior compromesso gratuito: 15 richieste/minuto e 1.000
+# richieste/giorno, ampiamente sufficienti per ~30 fonti due volte a
+# settimana. Se in futuro Google dismette anche questo modello, aggiorna
+# semplicemente il secret GEMINI_MODEL (o questo default) con il nuovo nome
+# stabile del momento - evitare gli alias "latest/preview" per l'uso in
+# produzione gratuita, perche' seguono sempre l'ultimo rilascio, che parte
+# quasi sempre con quote piu' strette finche' non si stabilizza.
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_HEADERS = {
@@ -125,7 +130,7 @@ MAX_CHARS_TOTAL = 45000
 # momentaneo dei server, non un errore nostro). GEMINI_MIN_INTERVAL_SEC tiene
 # un ritmo prudente tra una chiamata e l'altra; GEMINI_MAX_RETRIES/backoff
 # gestiscono i 429/503 riprovando invece di arrendersi al primo colpo.
-GEMINI_MIN_INTERVAL_SEC = 13
+GEMINI_MIN_INTERVAL_SEC = 5   # 15 RPM = 1 richiesta ogni 4s; teniamo 5s di margine
 GEMINI_MAX_RETRIES = 4
 GEMINI_BACKOFF_BASE_SEC = 15
 
@@ -519,7 +524,21 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
         if elapsed < GEMINI_MIN_INTERVAL_SEC:
             time.sleep(GEMINI_MIN_INTERVAL_SEC - elapsed)
 
-        resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+        try:
+            resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+        except requests.exceptions.RequestException as e:
+            # errori di rete/connessione (es. connection reset): li trattiamo
+            # come transitori esattamente come un 429/503, con lo stesso
+            # backoff, invece di farli sfuggire al retry.
+            _last_gemini_call_ts = time.time()
+            wait = GEMINI_BACKOFF_BASE_SEC * attempt
+            print(
+                f"  [i] Errore di connessione verso Gemini per {nome_fonte} "
+                f"(tentativo {attempt}/{GEMINI_MAX_RETRIES}): {e}. Riprovo tra {wait:.0f}s..."
+            )
+            time.sleep(wait)
+            continue
+
         _last_gemini_call_ts = time.time()
 
         if resp.status_code in (429, 503):
