@@ -9,7 +9,11 @@ on:
 jobs:
   scout:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Alzato da 20 a 35 minuti: con il ritmo prudente verso Gemini (per
+    # restare dentro i limiti del piano gratuito) e gli eventuali retry su
+    # 429/503, un giro completo su ~30 fonti può richiedere diversi minuti
+    # in più rispetto alla v1.
+    timeout-minutes: 35
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,3 +33,5 @@ jobs:
           NOTION_DB_FONTI_ID: ${{ secrets.NOTION_DB_FONTI_ID }}
           NOTION_DB_TRACKER_ID: ${{ secrets.NOTION_DB_TRACKER_ID }}
         run: python scout.py
+
+
