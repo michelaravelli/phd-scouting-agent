@@ -1,17 +1,8 @@
 """
-PhD Scouting Agent (v3) - Opportunity Discovery Engine
-------------------------------------------------------
-Legge il database "Fonti di Scouting" su Notion, esplora ogni fonte
-prioritizzando le pagine Call/News e i PDF allegati, analizza il contenuto
-con Gemini per identificare opportunità attive (Call for Papers, conferenze,
-summer school) e aggiorna il "PhD Scouting Tracker".
-
-Variabili d'ambiente richieste:
-  NOTION_TOKEN         - Internal Integration Secret di Notion
-  GEMINI_API_KEY        - Chiave API Google AI Studio
-  NOTION_DB_FONTI_ID     - ID database "Fonti di Scouting"
-  NOTION_DB_TRACKER_ID   - ID database "PhD Scouting Tracker"
-  GEMINI_MODEL           - Opzionale, default "gemini-2.5-flash-lite"
+PhD Scouting Agent (v3.1) - Opportunity Discovery Engine
+--------------------------------------------------------
+Fix applicato: Ripristinato GEMINI_MODEL di default su 'gemini-1.5-flash'
+per evitare l'errore HTTP 404 (Not Found).
 """
 
 import collections
@@ -27,7 +18,6 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# Gestione opzionale/tollerante dell'estrazione PDF
 try:
     import pypdf
 
@@ -37,7 +27,6 @@ except ImportError:
 
 
 def clean_secret(val, default=""):
-    """Pulisce la stringa rimuovendo sintassi Markdown, parentesi e spazi."""
     if not val:
         return default
     match = re.search(r"\((https?://[^\)]+)\)", val)
@@ -55,9 +44,9 @@ NOTION_TOKEN = clean_secret(os.environ.get("NOTION_TOKEN"))
 GEMINI_API_KEY = clean_secret(os.environ.get("GEMINI_API_KEY"))
 DB_FONTI_ID = clean_secret(os.environ.get("NOTION_DB_FONTI_ID"))
 DB_TRACKER_ID = clean_secret(os.environ.get("NOTION_DB_TRACKER_ID"))
-GEMINI_MODEL = clean_secret(
-    os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash-lite"
-)
+
+# FIX: Modello valido default per Google AI Studio v1beta
+GEMINI_MODEL = clean_secret(os.environ.get("GEMINI_MODEL"), "gemini-1.5-flash")
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_HEADERS = {
@@ -66,12 +55,6 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-)
-
-# Header HTTP completi per superare i blocchi 403/405 degli editori
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -83,14 +66,6 @@ REQUEST_HEADERS = {
     ),
     "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
     "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Chromium";v="128", "Not=A?Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 TIPO_OPZIONI = [
@@ -164,9 +139,9 @@ MAX_DEPTH = 2
 MAX_CHARS_PER_PAGE = 7000
 MAX_CHARS_TOTAL = 45000
 
-GEMINI_MIN_INTERVAL_SEC = 5
-GEMINI_MAX_RETRIES = 4
-GEMINI_BACKOFF_BASE_SEC = 15
+GEMINI_MIN_INTERVAL_SEC = 4
+GEMINI_MAX_RETRIES = 3
+GEMINI_BACKOFF_BASE_SEC = 5
 
 _last_gemini_call_ts = 0.0
 
@@ -318,18 +293,17 @@ def create_tracker_entry(item, fonte_url):
 
 
 # ---------------------------------------------------------------------------
-# Fetching & Content Extraction (HTML e PDF)
+# Content Extraction
 # ---------------------------------------------------------------------------
 
 
 def extract_pdf_text(content_bytes):
-    """Estrae il testo da un flusso binario PDF usando pypdf."""
     if not HAS_PYPDF:
         return ""
     try:
         reader = pypdf.PdfReader(io.BytesIO(content_bytes))
         text = []
-        for page in reader.pages[:10]:  # Massimale prime 10 pagine
+        for page in reader.pages[:10]:
             page_text = page.extract_text()
             if page_text:
                 text.append(page_text)
@@ -340,7 +314,6 @@ def extract_pdf_text(content_bytes):
 
 
 def fetch_resource(url):
-    """Recupera la Risorsa (HTML o PDF) gestendo redirect e user-agent."""
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
     resp.raise_for_status()
     ctype = resp.headers.get("Content-Type", "").lower()
@@ -387,7 +360,6 @@ def extract_candidate_links(base_url, html, use_weak_keywords):
         label = (a.get_text() or "").lower()
         haystack = f"{href} {label}".lower()
 
-        # Rileva se il link porta a un PDF
         is_pdf = href.lower().endswith(".pdf")
 
         if not is_pdf and not any(k in haystack for k in keywords):
@@ -411,12 +383,10 @@ def hash_text(text):
 
 
 def crawl_source(cfp_url, home_url):
-    """Esplora prioritariamente la pagina Call/News e poi la Homepage."""
     pages = {}
     visited = set()
     queue = collections.deque()
 
-    # Inserisce per prima la URL specifica della Call/News
     if cfp_url:
         domain = urlparse(cfp_url).netloc
         queue.append((cfp_url, 0, domain, True))
@@ -515,7 +485,7 @@ Se trovi opportunità valide, rispondi esclusivamente con un JSON in questo form
   ]
 }}
 
-TEXTO ESTRATTO DALLE PAGINE:
+TESTO ESTRATTO DALLE PAGINE:
 {testo}
 """
 
@@ -543,18 +513,24 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
         },
     }
 
+    # URL dinamica basata su GEMINI_MODEL
+    endpoint_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         elapsed = time.time() - _last_gemini_call_ts
         if elapsed < GEMINI_MIN_INTERVAL_SEC:
             time.sleep(GEMINI_MIN_INTERVAL_SEC - elapsed)
 
         try:
-            resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+            resp = requests.post(endpoint_url, json=payload, timeout=60)
         except requests.exceptions.RequestException as e:
             _last_gemini_call_ts = time.time()
             wait = GEMINI_BACKOFF_BASE_SEC * attempt
             print(
-                f"    [i] Errore connessione Gemini per {nome_fonte} (tentativo {attempt}): {e}. Retrying..."
+                f"    [i] Errore di rete Gemini per {nome_fonte} (tentativo {attempt}): {e}"
             )
             time.sleep(wait)
             continue
@@ -564,6 +540,17 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
         if resp.status_code in (429, 503):
             wait = GEMINI_BACKOFF_BASE_SEC * attempt
             time.sleep(wait)
+            continue
+
+        # Se restituisce 404 (modello invalido/deprecato), esegui un fallback su gemini-1.5-flash
+        if resp.status_code == 404 and GEMINI_MODEL != "gemini-1.5-flash":
+            print(
+                f"    [!] Modello '{GEMINI_MODEL}' non trovato (404). Fallback su 'gemini-1.5-flash'..."
+            )
+            endpoint_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            )
             continue
 
         resp.raise_for_status()
@@ -624,10 +611,8 @@ def main():
             print("    Nessuna pagina o risorsa raggiungibile.")
             continue
 
-        # Calcolo Hash corrente
         new_hash_map = {u: hash_text(t) for u, t in pages.items()}
 
-        # Verifica se prima esecuzione o hash aggiornato
         is_first_run = not bool(old_hash_raw and old_hash_raw.strip())
         old_hash_map = {}
         if not is_first_run:
@@ -641,9 +626,7 @@ def main():
         )
 
         if not changed:
-            print(
-                "    Nessuna modifica strutturale rilevata (fonte già analizzata)."
-            )
+            print("    Nessuna modifica rilevata (fonte già analizzata).")
             try:
                 update_fonte_status(page_id, new_hash_map, today)
             except Exception as e:
@@ -663,13 +646,11 @@ def main():
             print(f"    [!] Analisi Gemini fallita: {e}")
             continue
 
-        opportunita_aggiunte = 0
         for item in trovate:
             titolo = item.get("titolo")
             if not titolo:
                 continue
 
-            # Filtro per scadenze passate
             scadenza = item.get("scadenza")
             if scadenza and scadenza < today:
                 print(f"    (scaduto il {scadenza}, salto) {titolo}")
@@ -686,11 +667,9 @@ def main():
                 if link:
                     existing_keys.add(("url", link.rstrip("/").lower()))
                 print(f"    -> AGGIUNTA AL TRACKER: {titolo} [{scadenza}]")
-                opportunita_aggiunte += 1
             except Exception as e:
                 print(f"    [!] Errore salvataggio Tracker: {e}")
 
-        # Aggiornamento stato su Notion solo dopo completamento dell'analisi
         try:
             update_fonte_status(page_id, new_hash_map, today)
         except Exception as e:
