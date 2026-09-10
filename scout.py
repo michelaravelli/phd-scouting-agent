@@ -25,12 +25,28 @@ Rispetto alla v1, questa versione:
     avesse una scadenza, a meno di un vero special issue a termine).
   - fa scrivere a Gemini anche Costo e Modalita', quando deducibili.
 
+Rispetto alla v2 (dopo il debug del rate limiting Gemini), questa versione:
+  - salva il nuovo hash SOLO se Gemini ha risposto con successo: se la
+    chiamata fallisce, l'hash resta quello vecchio, cosi' la fonte verra'
+    ricontrollata al giro successivo invece di risultare "gia' controllata"
+    senza esserlo mai stata davvero.
+  - supporta FORCE_REANALYZE per un reset one-off di tutti gli hash.
+  - da' priorita', nel crawling, ai link che sembrano recenti (anno
+    corrente/futuro nell'URL, o nessun anno) rispetto a quelli con anni
+    passati (edizioni/CFP archiviate), per non sprecare il budget di pagine.
+  - legge anche i PDF (comuni nelle humanities) grazie a pypdf, non solo HTML.
+  - prova un feed RSS/Atom (tipico pattern WordPress "<url>/feed/") per ogni
+    URL di ingresso, prima del crawling HTML: se esiste, e' una fonte di
+    scoperta molto piu' pulita e affidabile dei link <a> indovinati.
+
 Variabili d'ambiente richieste (invariate rispetto alla v1, vedi .env.example):
   NOTION_TOKEN          - Internal Integration Secret di Notion
   GEMINI_API_KEY        - chiave API gratuita di Google AI Studio
   NOTION_DB_FONTI_ID     - ID del database "Fonti di Scouting"
   NOTION_DB_TRACKER_ID   - ID del database "PhD Scouting Tracker"
-  GEMINI_MODEL           - opzionale, default "gemini-2.0-flash"
+  GEMINI_MODEL           - opzionale, default "gemini-2.5-flash-lite"
+  FORCE_REANALYZE        - opzionale, "true" per ignorare gli hash salvati e
+                            rianalizzare tutto da zero (vedi workflow_dispatch)
 """
 
 import os
@@ -119,7 +135,7 @@ IGNORE_LINK_PATTERNS = [
     "tel:", "javascript:",
 ]
 
-MAX_PAGES_PER_FONTE = 12
+MAX_PAGES_PER_FONTE = 16
 MAX_DEPTH = 3  # hop massimi a partire dai punti di ingresso (home + call/news)
 MAX_CHARS_PER_PAGE = 6000
 MAX_CHARS_TOTAL = 45000
@@ -133,6 +149,16 @@ MAX_CHARS_TOTAL = 45000
 GEMINI_MIN_INTERVAL_SEC = 5   # 15 RPM = 1 richiesta ogni 4s; teniamo 5s di margine
 GEMINI_MAX_RETRIES = 4
 GEMINI_BACKOFF_BASE_SEC = 15
+
+# Se impostata (workflow_dispatch input "force_reanalyze", o a mano nei
+# secrets), ignora tutti gli hash salvati su Notion e tratta ogni fonte come
+# "cambiata", forzando una rianalisi completa. Serve soprattutto per casi
+# come questo: run precedenti in cui Gemini falliva avevano comunque salvato
+# l'hash (bug ora corretto), "avvelenando" lo stato - un reset una tantum
+# sblocca tutto senza dover svuotare a mano il campo "Ultimo Hash" su Notion.
+FORCE_REANALYZE = os.environ.get("FORCE_REANALYZE", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 _last_gemini_call_ts = 0.0
 
@@ -275,15 +301,42 @@ def create_tracker_entry(item, fonte_url):
 # Fetch, parsing e crawling multi-hop
 # ---------------------------------------------------------------------------
 
-def fetch_html(url):
+def fetch_page(url):
+    """Scarica una pagina e ne estrae il testo, gestendo sia HTML che PDF
+    (molte call for papers, specie in ambito umanistico, sono pubblicate
+    come PDF anziché come pagina HTML).
+
+    Ritorna (html_raw_o_None, testo_estratto, kind) dove kind e' "html" o
+    "pdf". html_raw e' None per i PDF (non hanno link <a> da seguire)."""
     resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
     resp.raise_for_status()
-    ctype = resp.headers.get("Content-Type", "")
-    if "html" not in ctype.lower():
-        # niente PDF/immagini/binari in questa v2: li ignoriamo silenziosamente
-        # (possibile miglioramento futuro: estrarre testo anche dai PDF)
-        raise ValueError(f"contenuto non HTML ({ctype}), salto")
-    return resp.text
+    ctype = resp.headers.get("Content-Type", "").lower()
+
+    if "pdf" in ctype or url.lower().endswith(".pdf"):
+        text = extract_text_from_pdf(resp.content)
+        return None, text, "pdf"
+
+    if "html" in ctype:
+        return resp.text, extract_text_from_html(resp.text), "html"
+
+    raise ValueError(f"contenuto non supportato ({ctype}), salto")
+
+
+def extract_text_from_pdf(content_bytes):
+    try:
+        from io import BytesIO
+        from pypdf import PdfReader
+    except ImportError as e:
+        raise ValueError(f"pypdf non installato: {e}")
+
+    reader = PdfReader(BytesIO(content_bytes))
+    parts = []
+    for pg in reader.pages:
+        try:
+            parts.append(pg.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(parts).strip()
 
 
 def extract_text_from_html(html):
@@ -301,10 +354,31 @@ def _is_ignored(url):
     return any(p in low for p in IGNORE_LINK_PATTERNS)
 
 
+_YEAR_RE = re.compile(r"(19|20)\d{2}")
+
+
+def _link_priority(url):
+    """Punteggio di priorita' per un link candidato, piu' basso = da
+    visitare prima. Le fonti spesso hanno pagine archiviate per ogni
+    edizione passata (2013, 2017, 2021...): senza una priorita', il budget
+    di pagine per fonte viene sprecato su quelle invece che sull'edizione
+    corrente/futura. Un link con un anno passato viene esplorato per
+    ultimo; uno con l'anno corrente o futuro, o senza anno nell'URL, ha
+    priorita' normale/alta."""
+    current_year = datetime.date.today().year
+    years = [int(y) for y in re.findall(r"(?:19|20)\d{2}", url)]
+    if not years:
+        return 0  # nessun anno nell'URL: probabilmente una pagina "sempre attuale"
+    if max(years) >= current_year:
+        return 0  # anno corrente o futuro: massima priorita'
+    return 1 + (current_year - max(years))  # piu' vecchio = piu' in fondo alla coda
+
+
 def extract_candidate_links(base_url, html, use_weak_keywords):
     """Trova nella pagina i link che sembrano portare a call/news/eventi.
     Ritorna una lista di URL assoluti (qualsiasi dominio: il filtro sul
-    dominio viene applicato dal chiamante, non qui)."""
+    dominio viene applicato dal chiamante, non qui), ordinati per priorita'
+    (contenuti recenti prima di quelli con anni passati nell'URL)."""
     soup = BeautifulSoup(html, "html.parser")
     keywords = STRONG_LINK_KEYWORDS + (WEAK_LINK_KEYWORDS if use_weak_keywords else [])
     found, seen = [], set()
@@ -328,6 +402,7 @@ def extract_candidate_links(base_url, html, use_weak_keywords):
         seen.add(norm)
         found.append(abs_url)
 
+    found.sort(key=_link_priority)
     return found
 
 
@@ -335,10 +410,87 @@ def hash_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+# --- Discovery via feed RSS/Atom --------------------------------------------
+# Molte delle fonti sono WordPress o OJS e spesso espongono un feed RSS/Atom
+# sulla loro pagina di categoria/news (tipicamente aggiungendo "feed/"
+# all'URL). Un feed e' testo strutturato e pulito - molto piu' affidabile
+# dell'euristica sui link <a> - quindi lo tentiamo per primo, per ogni URL
+# di ingresso, prima del crawling HTML classico. Se non esiste, si procede
+# come prima senza alcun impatto negativo.
+
+def _local_tag(tag):
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def parse_feed(xml_text, max_items=15):
+    """Parsa in modo tollerante un feed RSS 2.0 o Atom, ignorando i
+    namespace XML. Ritorna una lista di dict {titolo, link, descrizione,
+    data}."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    items = []
+    for el in root.iter():
+        if _local_tag(el.tag) not in ("item", "entry"):
+            continue
+        titolo = link = desc = data = None
+        for child in el:
+            ctag = _local_tag(child.tag)
+            if ctag == "title":
+                titolo = (child.text or "").strip()
+            elif ctag == "link":
+                link = (child.text or child.get("href") or "").strip()
+            elif ctag in ("description", "summary", "content", "encoded"):
+                if child.text:
+                    desc = child.text.strip()
+            elif ctag in ("pubDate", "updated", "published", "date"):
+                data = (child.text or "").strip()
+        if titolo:
+            items.append({"titolo": titolo, "link": link or "", "desc": desc or "", "data": data or ""})
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def discover_feed_items(entry_url, max_items=15):
+    """Prova a trovare un feed RSS/Atom per l'URL dato (tipico pattern
+    WordPress: <url>/feed/). Ritorna (feed_url, items) oppure (None, [])."""
+    base = entry_url.rstrip("/")
+    candidates = [base + "/feed/", base + "/feed", urljoin(entry_url, "feed/")]
+    tried = set()
+    for feed_url in candidates:
+        if feed_url in tried:
+            continue
+        tried.add(feed_url)
+        try:
+            resp = requests.get(feed_url, headers=REQUEST_HEADERS, timeout=15)
+            resp.raise_for_status()
+        except Exception:
+            continue
+        head = resp.text[:300].lower()
+        ctype = resp.headers.get("Content-Type", "").lower()
+        looks_like_feed = "xml" in ctype or "rss" in ctype or "<rss" in head or "<feed" in head
+        if not looks_like_feed:
+            continue
+        items = parse_feed(resp.text, max_items=max_items)
+        if items:
+            return feed_url, items
+    return None, []
+
+
 def crawl_source(entry_urls):
     """Esplora una fonte a partire da uno o due URL di ingresso (home page e/o
     pagina Call/News), seguendo link pertinenti fino a MAX_DEPTH hop e fino a
     MAX_PAGES_PER_FONTE pagine totali.
+
+    Prima del crawling HTML, prova un feed RSS/Atom per ciascun URL di
+    ingresso: se esiste, i suoi item vengono aggiunti sia come testo di
+    riepilogo (per dare subito a Gemini titoli/date di tutti i post
+    recenti) sia come pagine da visitare (per leggere il testo completo di
+    ciascuna call, non solo il riassunto del feed).
 
     Regole di navigazione:
       - dai punti di ingresso (depth 0) si seguono solo i link "forti"
@@ -349,13 +501,15 @@ def crawl_source(entry_urls):
         rimanda al sito ufficiale della conferenza ospitato altrove). Le
         pagine fuori dominio non vengono pero' ulteriormente espanse: sono
         sempre trattate come foglie.
+      - i link scoperti vengono esplorati dando priorita' a quelli che
+        sembrano recenti (anno corrente/futuro nell'URL, o nessun anno),
+        lasciando per ultimi quelli con anni passati (edizioni archiviate).
 
     Ritorna: dict {url: testo_estratto}
     """
     pages = {}
     visited = set()
     queue = collections.deque()
-    entry_domains = set()
 
     for u in entry_urls:
         if not u:
@@ -364,8 +518,28 @@ def crawl_source(entry_urls):
         if norm in visited:
             continue
         domain = urlparse(u).netloc
-        entry_domains.add(domain)
         queue.append((u, 0, domain, True))  # (url, depth, home_domain, is_same_domain_as_home)
+
+        try:
+            feed_url, items = discover_feed_items(u)
+        except Exception as e:
+            feed_url, items = None, []
+        if feed_url:
+            print(f"    (feed) trovato: {feed_url} ({len(items)} elementi)")
+            riepilogo = "\n".join(
+                f"- {it['titolo']} ({it['data']}) {it['link']}\n  {it['desc'][:300]}"
+                for it in items
+            )
+            pages[feed_url] = riepilogo[:MAX_CHARS_PER_PAGE]
+            for it in items:
+                if it["link"] and it["link"].rstrip("/") not in visited:
+                    link_domain = urlparse(it["link"]).netloc
+                    # gli item di un feed sono gia' un match "forte" per
+                    # definizione: li mettiamo in coda a profondita' 1 con
+                    # priorita' massima (in testa alla coda), cosi' vengono
+                    # letti per intero prima di qualunque link scoperto
+                    # euristicamente sull'HTML.
+                    queue.appendleft((it["link"], 1, link_domain, link_domain == domain))
 
     while queue and len(pages) < MAX_PAGES_PER_FONTE:
         url, depth, home_domain, same_domain_chain = queue.popleft()
@@ -375,15 +549,16 @@ def crawl_source(entry_urls):
         visited.add(norm)
 
         try:
-            html = fetch_html(url)
+            html, text, kind = fetch_page(url)
         except Exception as e:
             print(f"    [!] fetch fallito per {url}: {e}")
             continue
 
-        text = extract_text_from_html(html)
         pages[url] = text[:MAX_CHARS_PER_PAGE]
-        print(f"    (+) pagina letta: {url}")
+        print(f"    (+) pagina letta ({kind}): {url}")
 
+        if kind != "html":
+            continue  # un PDF e' sempre una foglia: nessun link da seguire
         if depth >= MAX_DEPTH or len(pages) >= MAX_PAGES_PER_FONTE:
             continue
         if not same_domain_chain:
@@ -585,6 +760,12 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
 def main():
     today = datetime.date.today().isoformat()
     check_gemini_model()
+    if FORCE_REANALYZE:
+        print(
+            "MODALITA' RESET FORZATO ATTIVA (FORCE_REANALYZE): ignoro tutti gli "
+            "hash salvati, ogni fonte con almeno una pagina raggiungibile verra' "
+            "rianalizzata da zero con Gemini."
+        )
     fonti = notion_query_active_fonti()
     print(f"Fonti attive da controllare: {len(fonti)}")
 
@@ -627,7 +808,7 @@ def main():
             continue
 
         old_hash_map = {}
-        if old_hash_raw:
+        if old_hash_raw and not FORCE_REANALYZE:
             try:
                 old_hash_map = json.loads(old_hash_raw)
             except json.JSONDecodeError:
