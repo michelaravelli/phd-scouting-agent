@@ -4,15 +4,24 @@ on:
   schedule:
     # Ogni martedì e venerdì alle 07:00 UTC (~09:00 ora italiana in inverno, 08:00/09:00 in estate)
     - cron: "0 7 * * 2,5"
-  workflow_dispatch: {}   # permette di lanciarlo a mano dal tab "Actions" per i test
+  workflow_dispatch:
+    inputs:
+      force_reanalyze:
+        description: >-
+          Ignora tutti gli hash salvati e rianalizza tutte le fonti da zero
+          (usalo se sospetti che dei run precedenti abbiano "avvelenato" lo
+          stato, es. dopo un blocco prolungato di Gemini)
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   scout:
     runs-on: ubuntu-latest
-    # Alzato da 20 a 35 minuti: con il ritmo prudente verso Gemini (per
-    # restare dentro i limiti del piano gratuito) e gli eventuali retry su
-    # 429/503, un giro completo su ~30 fonti può richiedere diversi minuti
-    # in più rispetto alla v1.
+    # Con il ritmo prudente verso Gemini (per restare dentro i limiti del
+    # piano gratuito), gli eventuali retry, e ora anche il tentativo di feed
+    # RSS per ogni fonte, un giro completo su ~30 fonti può richiedere
+    # diversi minuti.
     timeout-minutes: 35
     steps:
       - name: Checkout repository
@@ -32,6 +41,5 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTION_DB_FONTI_ID: ${{ secrets.NOTION_DB_FONTI_ID }}
           NOTION_DB_TRACKER_ID: ${{ secrets.NOTION_DB_TRACKER_ID }}
+          FORCE_REANALYZE: ${{ github.event.inputs.force_reanalyze }}
         run: python scout.py
-
-
