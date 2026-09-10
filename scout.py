@@ -65,18 +65,33 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 DB_FONTI_ID = os.environ["NOTION_DB_FONTI_ID"]
 DB_TRACKER_ID = os.environ["NOTION_DB_TRACKER_ID"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
-# Nota: fissiamo un modello stabile invece di un alias "latest". Da dic. 2025
-# Google ha ridotto parecchio le quote gratuite; oggi (set. 2026) i modelli
-# STABILI hanno quote piu' generose dei modelli "preview" (a cui puntano gli
-# alias tipo gemini-flash-latest / gemini-3-flash-preview). gemini-2.5-flash-
-# lite e' oggi il miglior compromesso gratuito: 15 richieste/minuto e 1.000
-# richieste/giorno, ampiamente sufficienti per ~30 fonti due volte a
-# settimana. Se in futuro Google dismette anche questo modello, aggiorna
-# semplicemente il secret GEMINI_MODEL (o questo default) con il nuovo nome
-# stabile del momento - evitare gli alias "latest/preview" per l'uso in
-# produzione gratuita, perche' seguono sempre l'ultimo rilascio, che parte
-# quasi sempre con quote piu' strette finche' non si stabilizza.
+
+# --- Selezione del modello Gemini, con fallback automatico -----------------
+# Abbiamo scoperto (set. 2026) che GET /v1beta/models/{nome} puo' rispondere
+# 200 (il modello "esiste") mentre la vera chiamata POST .../generateContent
+# sullo stesso modello risponde 404 - un problema segnalato piu' volte sui
+# forum ufficiali di Google in queste settimane, non qualcosa che dipende dal
+# nostro codice o dal nome scelto. Per non restare bloccati quando capita,
+# invece di puntare a un solo modello ne proviamo una lista in ordine, con
+# una VERA chiamata di prova (non solo ListModels) a inizio run: usiamo il
+# primo che risponde davvero, e ci fermiamo li' per tutto il run.
+#
+# Se GEMINI_MODEL e' impostata (env/secret), viene provata per prima; poi si
+# scende nella lista di riserva sottostante.
+_env_model = os.environ.get("GEMINI_MODEL", "").strip()
+GEMINI_MODEL_CANDIDATES = [
+    m for m in [
+        _env_model,
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-flash-latest",
+        "gemini-2.5-pro",  # ultima spiaggia: quota gratuita piu' bassa (5 RPM/100 RPD) ma modello maturo e stabile
+    ] if m
+]
+# rimuove eventuali doppioni mantenendo l'ordine
+GEMINI_MODEL_CANDIDATES = list(dict.fromkeys(GEMINI_MODEL_CANDIDATES))
+
+GEMINI_MODEL = GEMINI_MODEL_CANDIDATES[0]  # verra' aggiornato da check_gemini_model()
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_HEADERS = {
@@ -84,10 +99,14 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-)
+
+
+def _gemini_url(model):
+    return (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={GEMINI_API_KEY}"
+    )
+
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -649,31 +668,52 @@ TESTO RACCOLTO (puo' includere piu' pagine, separate da '--- Pagina: URL ---'):
 
 
 def check_gemini_model():
-    """Verifica una volta sola, a inizio run, che il modello configurato
-    esista e supporti generateContent - cosi' se Google lo ha dismesso lo
-    sappiamo subito con un messaggio chiaro, invece di scoprirlo dopo 33
-    fonti tutte fallite in silenzio (ognuna cattura l'errore e va avanti)."""
-    try:
-        resp = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}",
-            params={"key": GEMINI_API_KEY},
-            timeout=15,
-        )
+    """Prova, con una VERA chiamata di prova a generateContent (non solo
+    GET /models/{nome}, che si e' rivelato inaffidabile: puo' rispondere 200
+    anche per modelli che poi rispondono 404 sulla generazione vera), ogni
+    modello in GEMINI_MODEL_CANDIDATES in ordine, e fissa il primo che
+    funziona davvero come GEMINI_MODEL per il resto del run. Se nessuno
+    funziona, lo script prosegue comunque (ogni fonte fallira' e verra'
+    riprovata al prossimo giro, senza corrompere gli hash)."""
+    global GEMINI_MODEL
+    probe_payload = {"contents": [{"parts": [{"text": "rispondi solo: ok"}]}]}
+
+    for candidate in GEMINI_MODEL_CANDIDATES:
+        try:
+            resp = requests.post(_gemini_url(candidate), json=probe_payload, timeout=20)
+        except requests.exceptions.RequestException as e:
+            print(f"  [i] Modello '{candidate}' non raggiungibile ({e}), provo il successivo...")
+            continue
+
+        if resp.status_code == 200:
+            GEMINI_MODEL = candidate
+            print(f"Modello Gemini verificato e attivo per questo run: {GEMINI_MODEL}")
+            return True
+
         if resp.status_code == 404:
+            print(f"  [i] Modello '{candidate}' risponde 404 su generateContent, provo il successivo...")
+            continue
+
+        if resp.status_code in (429, 503):
+            # il modello esiste ed e' valido, e' solo temporaneamente occupato:
+            # lo teniamo come attivo, ci pensera' il retry in ask_gemini
+            GEMINI_MODEL = candidate
             print(
-                f"ATTENZIONE: il modello '{GEMINI_MODEL}' non esiste o e' stato "
-                "dismesso da Google (404). Lo script proseguira' ma NON troverà "
-                "nulla, perché ogni chiamata a Gemini fallirà. Aggiorna la "
-                "variabile GEMINI_MODEL (es. 'gemini-flash-latest', "
-                "'gemini-3-flash-preview', 'gemini-2.5-flash')."
+                f"Modello Gemini scelto: {GEMINI_MODEL} (al momento {resp.status_code}, "
+                "gestito dal retry durante il run)"
             )
-            return False
-        resp.raise_for_status()
-        print(f"Modello Gemini verificato: {GEMINI_MODEL}")
-        return True
-    except Exception as e:
-        print(f"  [!] Impossibile verificare il modello Gemini in anticipo: {e}")
-        return True  # non blocchiamo il run per un errore di rete sul check
+            return True
+
+        print(f"  [i] Modello '{candidate}' risposta inattesa ({resp.status_code}), provo il successivo...")
+
+    print(
+        "ATTENZIONE: nessuno dei modelli candidati "
+        f"({', '.join(GEMINI_MODEL_CANDIDATES)}) risponde correttamente a "
+        "generateContent in questo momento. Lo script proseguira' comunque: "
+        "ogni fonte fallira' l'analisi ma NON verra' segnata come controllata, "
+        "quindi verra' ritentata al prossimo giro senza perdere nulla."
+    )
+    return False
 
 
 class GeminiCallFailedError(Exception):
@@ -686,7 +726,7 @@ class GeminiCallFailedError(Exception):
 
 
 def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
-    global _last_gemini_call_ts
+    global _last_gemini_call_ts, GEMINI_MODEL
 
     prompt = PROMPT_TEMPLATE.format(
         nome_fonte=nome_fonte,
@@ -709,7 +749,7 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
             time.sleep(GEMINI_MIN_INTERVAL_SEC - elapsed)
 
         try:
-            resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+            resp = requests.post(_gemini_url(GEMINI_MODEL), json=payload, timeout=60)
         except requests.exceptions.RequestException as e:
             # errori di rete/connessione (es. connection reset): li trattiamo
             # come transitori esattamente come un 429/503, con lo stesso
@@ -724,6 +764,21 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
             continue
 
         _last_gemini_call_ts = time.time()
+
+        if resp.status_code == 404:
+            # il modello attivo ha smesso di funzionare a meta' run (capita:
+            # vedi nota su check_gemini_model). Passiamo al successivo
+            # candidato, se c'e' ne, invece di continuare a sbattere sullo
+            # stesso modello morto per tutte le fonti restanti.
+            idx = GEMINI_MODEL_CANDIDATES.index(GEMINI_MODEL) if GEMINI_MODEL in GEMINI_MODEL_CANDIDATES else -1
+            if idx >= 0 and idx + 1 < len(GEMINI_MODEL_CANDIDATES):
+                nuovo = GEMINI_MODEL_CANDIDATES[idx + 1]
+                print(f"  [i] Modello '{GEMINI_MODEL}' risponde 404, passo a '{nuovo}' per il resto del run.")
+                GEMINI_MODEL = nuovo
+                continue
+            print(f"  [i] Modello '{GEMINI_MODEL}' risponde 404 e non ci sono altri candidati (tentativo {attempt}/{GEMINI_MAX_RETRIES}).")
+            time.sleep(GEMINI_BACKOFF_BASE_SEC)
+            continue
 
         if resp.status_code in (429, 503):
             retry_after = resp.headers.get("Retry-After")
