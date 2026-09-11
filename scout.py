@@ -44,7 +44,9 @@ Variabili d'ambiente richieste (invariate rispetto alla v1, vedi .env.example):
   GEMINI_API_KEY        - chiave API gratuita di Google AI Studio
   NOTION_DB_FONTI_ID     - ID del database "Fonti di Scouting"
   NOTION_DB_TRACKER_ID   - ID del database "PhD Scouting Tracker"
-  GEMINI_MODEL           - opzionale, default "gemini-2.5-flash-lite"
+  GEMINI_MODEL           - opzionale, forza un modello specifico (altrimenti
+                            si prova una lista di modelli di riserva, in
+                            ordine, e si usa il primo che risponde davvero)
   FORCE_REANALYZE        - opzionale, "true" per ignorare gli hash salvati e
                             rianalizzare tutto da zero (vedi workflow_dispatch)
 """
@@ -78,14 +80,24 @@ DB_TRACKER_ID = os.environ["NOTION_DB_TRACKER_ID"]
 #
 # Se GEMINI_MODEL e' impostata (env/secret), viene provata per prima; poi si
 # scende nella lista di riserva sottostante.
+#
+# Nota (set. 2026): la serie di modelli Gemini 2.5 e' in dismissione (Gemini
+# 2.5 Flash chiude il 16 ottobre 2026) e i progetti/chiavi piu' recenti
+# spesso perdono l'accesso alle serie in via di dismissione anche PRIMA della
+# data ufficiale di fine vita - e' probabilmente per questo che 2.5-flash-lite
+# e 2.5-flash rispondono 404 nonostante esistano ancora "sulla carta". La
+# generazione attuale e' Gemini 3.x: gemini-3.1-flash-lite e' oggi (set. 2026)
+# il modello STABILE (non preview) con la quota gratuita migliore, 30
+# richieste/minuto e 1.500/giorno.
 _env_model = os.environ.get("GEMINI_MODEL", "").strip()
 GEMINI_MODEL_CANDIDATES = [
     m for m in [
         _env_model,
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
         "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
         "gemini-flash-latest",
-        "gemini-2.5-pro",  # ultima spiaggia: quota gratuita piu' bassa (5 RPM/100 RPD) ma modello maturo e stabile
+        "gemini-2.5-pro",  # ultima spiaggia: quota gratuita piu' bassa ma modello maturo
     ] if m
 ]
 # rimuove eventuali doppioni mantenendo l'ordine
@@ -160,14 +172,22 @@ MAX_CHARS_PER_PAGE = 6000
 MAX_CHARS_TOTAL = 45000
 
 # --- Parametri di chiamata a Gemini -----------------------------------------
-# Il piano gratuito ha limiti stretti di richieste al minuto (nell'ordine di
-# 5-15 RPM a seconda del modello) e ogni tanto risponde 503 (sovraccarico
-# momentaneo dei server, non un errore nostro). GEMINI_MIN_INTERVAL_SEC tiene
-# un ritmo prudente tra una chiamata e l'altra; GEMINI_MAX_RETRIES/backoff
-# gestiscono i 429/503 riprovando invece di arrendersi al primo colpo.
-GEMINI_MIN_INTERVAL_SEC = 5   # 15 RPM = 1 richiesta ogni 4s; teniamo 5s di margine
-GEMINI_MAX_RETRIES = 4
-GEMINI_BACKOFF_BASE_SEC = 15
+# Il piano gratuito ha limiti di richieste al minuto/giorno che variano per
+# modello, e ogni tanto risponde 503 (sovraccarico momentaneo dei server).
+# GEMINI_MIN_INTERVAL_SEC tiene un ritmo prudente tra una chiamata e l'altra.
+#
+# IMPORTANTE: se un modello e' saturo (429 persistente, non solo un picco
+# momentaneo), NON ha senso insistere a lungo con backoff crescenti: meglio
+# passare subito al modello di riserva successivo. Per questo ogni modello
+# ha solo GEMINI_ATTEMPTS_PER_MODEL tentativi (con backoff breve) prima che
+# si passi al candidato successivo in GEMINI_MODEL_CANDIDATES; si gira
+# sull'intera lista al massimo GEMINI_MAX_MODEL_ROTATIONS volte in totale,
+# cosi' il tempo massimo speso per una singola fonte resta limitato anche
+# nel caso (raro) in cui tutti i modelli siano temporaneamente saturi.
+GEMINI_MIN_INTERVAL_SEC = 3
+GEMINI_ATTEMPTS_PER_MODEL = 2
+GEMINI_BACKOFF_BASE_SEC = 10
+GEMINI_MAX_MODEL_ROTATIONS = 1  # 1 giro completo della lista candidati = al massimo
 
 # Se impostata (workflow_dispatch input "force_reanalyze", o a mano nei
 # secrets), ignora tutti gli hash salvati su Notion e tratta ogni fonte come
@@ -741,70 +761,74 @@ def ask_gemini(nome_fonte, categoria, frequenza, natura, combined_text):
         "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"},
     }
 
-    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
-        # rispettiamo un ritmo minimo tra le chiamate per stare dentro il
-        # rate limit del piano gratuito (evita 429 "preventivamente")
-        elapsed = time.time() - _last_gemini_call_ts
-        if elapsed < GEMINI_MIN_INTERVAL_SEC:
-            time.sleep(GEMINI_MIN_INTERVAL_SEC - elapsed)
+    # partiamo dal modello attualmente attivo (di solito quello scelto da
+    # check_gemini_model, o l'ultimo che ha funzionato in questo run) e
+    # giriamo sulla lista di candidati al massimo GEMINI_MAX_MODEL_ROTATIONS
+    # volte, con solo GEMINI_ATTEMPTS_PER_MODEL tentativi brevi per modello:
+    # se un modello e' saturo, meglio passare al successivo che insistere.
+    start_idx = (
+        GEMINI_MODEL_CANDIDATES.index(GEMINI_MODEL)
+        if GEMINI_MODEL in GEMINI_MODEL_CANDIDATES else 0
+    )
+    total_models_to_try = len(GEMINI_MODEL_CANDIDATES) * GEMINI_MAX_MODEL_ROTATIONS
 
-        try:
-            resp = requests.post(_gemini_url(GEMINI_MODEL), json=payload, timeout=60)
-        except requests.exceptions.RequestException as e:
-            # errori di rete/connessione (es. connection reset): li trattiamo
-            # come transitori esattamente come un 429/503, con lo stesso
-            # backoff, invece di farli sfuggire al retry.
-            _last_gemini_call_ts = time.time()
-            wait = GEMINI_BACKOFF_BASE_SEC * attempt
-            print(
-                f"  [i] Errore di connessione verso Gemini per {nome_fonte} "
-                f"(tentativo {attempt}/{GEMINI_MAX_RETRIES}): {e}. Riprovo tra {wait:.0f}s..."
-            )
-            time.sleep(wait)
-            continue
+    for i in range(total_models_to_try):
+        model = GEMINI_MODEL_CANDIDATES[(start_idx + i) % len(GEMINI_MODEL_CANDIDATES)]
+        model_dead = False  # 404: non ha senso ritentare piu' volte lo stesso modello
 
-        _last_gemini_call_ts = time.time()
+        for attempt in range(1, GEMINI_ATTEMPTS_PER_MODEL + 1):
+            elapsed = time.time() - _last_gemini_call_ts
+            if elapsed < GEMINI_MIN_INTERVAL_SEC:
+                time.sleep(GEMINI_MIN_INTERVAL_SEC - elapsed)
 
-        if resp.status_code == 404:
-            # il modello attivo ha smesso di funzionare a meta' run (capita:
-            # vedi nota su check_gemini_model). Passiamo al successivo
-            # candidato, se c'e' ne, invece di continuare a sbattere sullo
-            # stesso modello morto per tutte le fonti restanti.
-            idx = GEMINI_MODEL_CANDIDATES.index(GEMINI_MODEL) if GEMINI_MODEL in GEMINI_MODEL_CANDIDATES else -1
-            if idx >= 0 and idx + 1 < len(GEMINI_MODEL_CANDIDATES):
-                nuovo = GEMINI_MODEL_CANDIDATES[idx + 1]
-                print(f"  [i] Modello '{GEMINI_MODEL}' risponde 404, passo a '{nuovo}' per il resto del run.")
-                GEMINI_MODEL = nuovo
+            try:
+                resp = requests.post(_gemini_url(model), json=payload, timeout=60)
+            except requests.exceptions.RequestException as e:
+                _last_gemini_call_ts = time.time()
+                wait = GEMINI_BACKOFF_BASE_SEC * attempt
+                print(
+                    f"  [i] Errore di connessione verso Gemini ('{model}') per {nome_fonte} "
+                    f"(tentativo {attempt}/{GEMINI_ATTEMPTS_PER_MODEL}): {e}. Riprovo tra {wait:.0f}s..."
+                )
+                time.sleep(wait)
                 continue
-            print(f"  [i] Modello '{GEMINI_MODEL}' risponde 404 e non ci sono altri candidati (tentativo {attempt}/{GEMINI_MAX_RETRIES}).")
-            time.sleep(GEMINI_BACKOFF_BASE_SEC)
-            continue
 
-        if resp.status_code in (429, 503):
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after:
-                wait = float(retry_after)
-            else:
-                wait = GEMINI_BACKOFF_BASE_SEC * attempt  # backoff lineare crescente
-            print(
-                f"  [i] Gemini {resp.status_code} per {nome_fonte} "
-                f"(tentativo {attempt}/{GEMINI_MAX_RETRIES}), riprovo tra {wait:.0f}s..."
-            )
-            time.sleep(wait)
-            continue
+            _last_gemini_call_ts = time.time()
 
-        resp.raise_for_status()
-        data = resp.json()
-        try:
-            raw = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(raw)
-            return parsed.get("trovate", [])
-        except (KeyError, IndexError, json.JSONDecodeError):
-            print(f"  [!] Risposta Gemini non interpretabile per {nome_fonte}: {data}")
-            raise GeminiCallFailedError(f"risposta non interpretabile: {data}")
+            if resp.status_code == 404:
+                print(f"  [i] Modello '{model}' risponde 404, passo al successivo candidato.")
+                model_dead = True
+                break  # niente altri tentativi su un modello che non esiste/non e' accessibile
+
+            if resp.status_code in (429, 503):
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else GEMINI_BACKOFF_BASE_SEC * attempt
+                print(
+                    f"  [i] Gemini {resp.status_code} su '{model}' per {nome_fonte} "
+                    f"(tentativo {attempt}/{GEMINI_ATTEMPTS_PER_MODEL}), riprovo tra {wait:.0f}s..."
+                )
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+            try:
+                raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(raw)
+                if model != GEMINI_MODEL:
+                    print(f"  [i] Modello attivo aggiornato a '{model}' per il resto del run.")
+                    GEMINI_MODEL = model
+                return parsed.get("trovate", [])
+            except (KeyError, IndexError, json.JSONDecodeError):
+                print(f"  [!] Risposta Gemini non interpretabile per {nome_fonte}: {data}")
+                raise GeminiCallFailedError(f"risposta non interpretabile: {data}")
+
+        if not model_dead:
+            print(f"  [i] Modello '{model}' ancora saturo dopo {GEMINI_ATTEMPTS_PER_MODEL} tentativi, passo al successivo.")
 
     raise GeminiCallFailedError(
-        f"Gemini irraggiungibile per {nome_fonte} dopo {GEMINI_MAX_RETRIES} tentativi"
+        f"Gemini irraggiungibile per {nome_fonte}: tutti i modelli candidati "
+        f"({', '.join(GEMINI_MODEL_CANDIDATES)}) hanno fallito"
     )
 
 
