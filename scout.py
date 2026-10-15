@@ -36,7 +36,12 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 DB_FONTI_ID = os.environ["NOTION_DB_FONTI_ID"]
 DB_TRACKER_ID = os.environ["NOTION_DB_TRACKER_ID"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+# Modelli Gemini in ordine di preferenza. gemini-2.0-flash e' stato SPENTO da Google il
+# 1 giugno 2026 (ogni chiamata dava errore). Se GEMINI_MODEL e' impostato viene provato per
+# primo; se non esiste piu', lo script passa da solo al successivo.
+GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL")] if m] + [
+    "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+_model_idx = 0
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_HEADERS = {
@@ -47,10 +52,12 @@ NOTION_HEADERS = {
 # versione piu' recente: serve per template e query sul Tracker
 NOTION_HEADERS_NEW = {**NOTION_HEADERS, "Notion-Version": "2025-09-03"}
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-)
+
+
+def gemini_url(model):
+    return (f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={GEMINI_API_KEY}")
+
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -532,23 +539,49 @@ __TESTO__
 """
 
 
+def gemini_request(payload):
+    """Chiama Gemini con tentativi automatici; se il modello non esiste piu' passa al successivo."""
+    global _model_idx
+    while _model_idx < len(GEMINI_MODELS):
+        model = GEMINI_MODELS[_model_idx]
+        for attempt in range(4):
+            resp = requests.post(gemini_url(model), json=payload, timeout=90)
+            if resp.status_code in (429, 500, 502, 503):
+                wait = 15 * (attempt + 1)
+                print(f"  [!] Gemini occupato ({resp.status_code}), riprovo tra {wait}s...")
+                time.sleep(wait)
+                continue
+            break
+        else:
+            raise RuntimeError("Gemini non disponibile (limite di richieste?)")
+        if resp.status_code == 404 or (resp.status_code == 400 and "model" in resp.text.lower()):
+            print(f"  [!] Modello {model} non disponibile ({resp.status_code}): provo il successivo.")
+            _model_idx += 1
+            continue
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:200]}")
+        return resp.json()
+    raise RuntimeError("nessun modello Gemini disponibile: imposta GEMINI_MODEL con un modello attivo")
+
+
+def gemini_check():
+    """Prova veloce all'avvio: dice subito se Gemini funziona e con quale modello."""
+    try:
+        gemini_request({"contents": [{"parts": [{"text": "Rispondi solo con: ok"}]}]})
+        print(f"Gemini OK (modello: {GEMINI_MODELS[_model_idx]})")
+        return True
+    except Exception as e:
+        print(f"[!!] GEMINI NON FUNZIONA: {e}")
+        print("[!!] Le fonti che richiedono Gemini non verranno analizzate (WikiCFP e PhilEvents si').")
+        return False
+
+
 def ask_gemini(nome, url, text):
     prompt = (PROMPT.replace("__OGGI__", TODAY.isoformat()).replace("__NOME__", nome)
               .replace("__URL__", url).replace("__TESTO__", text))
     payload = {"contents": [{"parts": [{"text": prompt}]}],
-               "generationConfig": {"temperature": 0.1, "response_mime_type": "application/json"}}
-    for attempt in range(4):
-        resp = requests.post(GEMINI_URL, json=payload, timeout=90)
-        if resp.status_code in (429, 500, 502, 503):
-            wait = 15 * (attempt + 1)
-            print(f"  [!] Gemini occupato ({resp.status_code}), riprovo tra {wait}s...")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        break
-    else:
-        raise RuntimeError("Gemini non disponibile (limite di richieste?)")
-    data = resp.json()
+               "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}}
+    data = gemini_request(payload)
     try:
         raw = data["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(raw).get("trovate", [])
@@ -595,6 +628,7 @@ def main():
     fonti = notion_query_active_fonti()
     print(f"Fonti attive da controllare: {len(fonti)}" + (" (controllo forzato)" if force else ""))
     tracker_info()
+    gemini_check()
 
     added_total, seen_titles = 0, set()
 
