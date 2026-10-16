@@ -65,7 +65,26 @@ REQUEST_HEADERS = {
     )
 }
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # il log appare subito anche se il job viene interrotto
+except Exception:
+    pass
+
 TODAY = datetime.date.today()
+START = time.time()
+# tempo massimo di lavoro: poi lo script si ferma da solo e le fonti rimaste
+# vengono riprese alla prossima esecuzione (il job su GitHub deve durare di piu')
+MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME_MIN", "20")) * 60
+# le fonti analizzate con successo da questa versione salvano un hash con questo prefisso:
+# cosi' quelle mai analizzate (hash vecchio) vengono riprese in automatico, senza --force
+HASH_PREFIX = "v2:"
+_gemini_dead = False
+
+
+def elapsed():
+    t = int(time.time() - START)
+    return f"{t // 60:02d}:{t % 60:02d}"
+
 
 TIPO_OPZIONI = ["Journal CFP", "Conferenza", "Summer School",
                 "Evento gratuito online", "Lezione/Seminario"]
@@ -80,8 +99,8 @@ CFP_CONTEXT_RE = re.compile(
     r"|\bcfp\b|convocatoria|appel\s+à", re.I)
 
 CHUNK_CHARS = 15000      # dimensione di ogni pezzo di testo mandato a Gemini
-MAX_CHUNKS = 4           # massimo pezzi per pagina
-GEMINI_DELAY = 5         # secondi tra una chiamata e l'altra (limiti del piano gratuito)
+MAX_CHUNKS = 3           # massimo pezzi per pagina
+GEMINI_DELAY = 4         # secondi tra una chiamata e l'altra (limiti del piano gratuito)
 
 GENERIC_AGGREGATORS = ["iass-ais.org"]   # elenchi di post senza lettore dedicato
 WIKICFP_MAX_PAGES = 3
@@ -265,7 +284,7 @@ def create_tracker_entry(item, fonte_url, found_iso_date):
 # ---------------------------------------------------------------------------
 
 def fetch_html(url):
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
     resp.raise_for_status()
     return resp.text
 
@@ -540,28 +559,40 @@ __TESTO__
 
 
 def gemini_request(payload):
-    """Chiama Gemini con tentativi automatici; se il modello non esiste piu' passa al successivo."""
-    global _model_idx
+    """Chiama Gemini. Se il modello non esiste piu' o ha finito la quota passa al successivo;
+    se non ce n'e' nessuno, disattiva Gemini per tutta l'esecuzione (niente attese inutili)."""
+    global _model_idx, _gemini_dead
+    if _gemini_dead:
+        raise RuntimeError("Gemini disattivato per questa esecuzione (errori ripetuti)")
     while _model_idx < len(GEMINI_MODELS):
         model = GEMINI_MODELS[_model_idx]
-        for attempt in range(4):
-            resp = requests.post(gemini_url(model), json=payload, timeout=90)
-            if resp.status_code in (429, 500, 502, 503):
-                wait = 15 * (attempt + 1)
-                print(f"  [!] Gemini occupato ({resp.status_code}), riprovo tra {wait}s...")
-                time.sleep(wait)
-                continue
-            break
-        else:
-            raise RuntimeError("Gemini non disponibile (limite di richieste?)")
-        if resp.status_code == 404 or (resp.status_code == 400 and "model" in resp.text.lower()):
-            print(f"  [!] Modello {model} non disponibile ({resp.status_code}): provo il successivo.")
+        resp = None
+        for attempt in range(3):
+            resp = requests.post(gemini_url(model), json=payload, timeout=60)
+            if resp.status_code not in (429, 500, 502, 503):
+                break
+            quota_over = resp.status_code == 429 and ("limit: 0" in resp.text or "PerDay" in resp.text)
+            if quota_over or attempt == 2:
+                break
+            m = re.search(r'"retryDelay":\s*"(\d+)', resp.text)
+            wait = min((int(m.group(1)) + 2) if m else 20, 45)
+            print(f"  [!] Gemini occupato ({resp.status_code}), riprovo tra {wait}s...")
+            time.sleep(wait)
+        if resp.status_code in (404, 429) or (resp.status_code == 400 and "model" in resp.text.lower()):
+            print(f"  [!] Modello {model} non utilizzabile ({resp.status_code}): provo il successivo.")
             _model_idx += 1
             continue
         if resp.status_code >= 400:
             raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:200]}")
         return resp.json()
-    raise RuntimeError("nessun modello Gemini disponibile: imposta GEMINI_MODEL con un modello attivo")
+    _gemini_dead = True
+    raise RuntimeError("nessun modello Gemini utilizzabile (quota finita o modelli spenti): "
+                       "imposta GEMINI_MODEL con un modello attivo")
+
+
+def needs_gemini(url):
+    host = urlparse(url).netloc.lower()
+    return not ("wikicfp.com" in host or "philevents.org" in host)
 
 
 def gemini_check():
@@ -632,7 +663,11 @@ def main():
 
     added_total, seen_titles = 0, set()
 
-    for page in fonti:
+    for idx, page in enumerate(fonti):
+        if time.time() - START > MAX_RUNTIME:
+            print(f"[!] Tempo massimo raggiunto ({elapsed()}): restano {len(fonti) - idx} fonti. "
+                  f"Verranno riprese alla prossima esecuzione (lancia di nuovo il workflow).")
+            break
         page_id = page["id"]
         nome = get_prop_text(page, "Nome", kind="title") or "(senza nome)"
         urls = collect_urls(page)
@@ -645,7 +680,11 @@ def main():
             print(f"- {nome}: richiede browser (JS), non supportato, salto.")
             continue
 
-        print(f"- {nome}: {len(urls)} indirizzo/i")
+        if _gemini_dead and any(needs_gemini(u) for u in urls):
+            print(f"- {nome}: salto (Gemini non disponibile), riprovera' la prossima volta.")
+            continue
+
+        print(f"- [{elapsed()}] {nome}: {len(urls)} indirizzo/i")
         parts = []  # (url, tipo, contenuto)
         for u in urls:
             try:
@@ -659,7 +698,7 @@ def main():
         canon = "\n".join(
             "\n".join(sorted(f"{i['link']}|{i['scadenza']}" for i in p)) if k == "items" else p
             for _, k, p in parts)
-        new_hash = hash_text(canon)
+        new_hash = HASH_PREFIX + hash_text(canon)
 
         if new_hash == old_hash and not force:
             print("  Nessuna modifica rilevata.")
