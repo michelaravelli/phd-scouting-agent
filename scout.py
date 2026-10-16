@@ -40,7 +40,7 @@ DB_TRACKER_ID = os.environ["NOTION_DB_TRACKER_ID"]
 # 1 giugno 2026 (ogni chiamata dava errore). Se GEMINI_MODEL e' impostato viene provato per
 # primo; se non esiste piu', lo script passa da solo al successivo.
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL")] if m] + [
-    "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+    "gemini-3.1-flash-lite", "gemini-3.5-flash"]
 _model_idx = 0
 
 NOTION_API = "https://api.notion.com/v1"
@@ -210,13 +210,16 @@ def tracker_info():
     """id del data source del Tracker + id del template 'CFP' (se esiste)."""
     if _TRACKER:
         return _TRACKER
-    _TRACKER.update({"id": None, "tpl": None})
+    _TRACKER.update({"id": None, "tpl": None, "props": None})
     try:
         r = requests.get(f"{NOTION_API}/databases/{DB_TRACKER_ID}",
                          headers=NOTION_HEADERS_NEW, timeout=30)
         r.raise_for_status()
         ds_id = r.json()["data_sources"][0]["id"]
         _TRACKER["id"] = ds_id
+        sch = requests.get(f"{NOTION_API}/data_sources/{ds_id}", headers=NOTION_HEADERS_NEW, timeout=30)
+        sch.raise_for_status()
+        _TRACKER["props"] = sch.json().get("properties", {})
         t = requests.get(f"{NOTION_API}/data_sources/{ds_id}/templates",
                          headers=NOTION_HEADERS_NEW, timeout=30)
         t.raise_for_status()
@@ -250,19 +253,62 @@ def tracker_exists(item, fonte_url):
         return False
 
 
-def create_tracker_entry(item, fonte_url, found_iso_date):
-    props = {
-        "Nome": {"title": [{"text": {"content": item["titolo"][:200]}}]},
-        "Fonte": {"url": item.get("link") or fonte_url},
-        "Tipo": {"select": {"name": item["tipo"]}},
-        "Stato": {"select": {"name": "🆕 Da valutare"}},
-        "Trovato il": {"date": {"start": found_iso_date}},
-        "Costo": {"select": {"name": "Non specificato"}},
-        "Scadenza": {"date": {"start": item["scadenza"]}},
-    }
-    if item.get("note"):
-        props["Note"] = {"rich_text": [{"text": {"content": item["note"][:1900]}}]}
+def _find_prop(schema, names, types):
+    for n in names:
+        for k, v in schema.items():
+            if norm(k) == norm(n) and v.get("type") in types:
+                return k
+    return None
 
+
+_WARNED = set()
+
+
+def build_props(item, fonte_url, found_iso):
+    """Costruisce le proprieta' usando SOLO quelle che esistono nel Tracker (se una e' stata
+    rinominata o cancellata, la salta e lo scrive nel log invece di far fallire tutto)."""
+    schema = tracker_info().get("props")
+    link = item.get("link") or fonte_url
+    if not schema:  # schema non leggibile: uso i nomi storici
+        return {
+            "Nome": {"title": [{"text": {"content": item["titolo"][:200]}}]},
+            "Fonte": {"url": link}, "Tipo": {"select": {"name": item["tipo"]}},
+            "Stato": {"select": {"name": "🆕 Da valutare"}},
+            "Scadenza": {"date": {"start": item["scadenza"]}},
+            "Note": {"rich_text": [{"text": {"content": (item.get("note") or "")[:1900]}}]},
+        }
+    props = {}
+
+    def put(label, names, types, builder, required=False):
+        k = _find_prop(schema, names, types)
+        if k:
+            props[k] = builder(schema[k])
+        elif label not in _WARNED:
+            _WARNED.add(label)
+            print(f"  [!] Nel Tracker non esiste la proprieta' '{label}': la salto.")
+
+    tk = next((k for k, v in schema.items() if v.get("type") == "title"), None)
+    if tk:
+        props[tk] = {"title": [{"text": {"content": item["titolo"][:200]}}]}
+    put("Fonte", ["Fonte", "Link", "URL"], ["url"], lambda d: {"url": link})
+    put("Tipo", ["Tipo"], ["select"], lambda d: {"select": {"name": item["tipo"]}})
+
+    def stato(d):
+        opts = (d.get(d["type"]) or {}).get("options", [])
+        o = next((x["name"] for x in opts if "da valutare" in norm(x["name"])), "🆕 Da valutare")
+        return {d["type"]: {"name": o}}
+    put("Stato", ["Stato", "Status"], ["select", "status"], stato)
+    put("Trovato il", ["Trovato il", "Trovato"], ["date"], lambda d: {"date": {"start": found_iso}})
+    put("Costo", ["Costo"], ["select"], lambda d: {"select": {"name": "Non specificato"}})
+    put("Scadenza", ["Scadenza"], ["date"], lambda d: {"date": {"start": item["scadenza"]}})
+    if item.get("note"):
+        put("Note", ["Note"], ["rich_text"],
+            lambda d: {"rich_text": [{"text": {"content": item["note"][:1900]}}]})
+    return props
+
+
+def create_tracker_entry(item, fonte_url, found_iso_date):
+    props = build_props(item, fonte_url, found_iso_date)
     info = tracker_info()
     if info["id"] and info["tpl"]:
         body = {"parent": {"type": "data_source_id", "data_source_id": info["id"]},
@@ -271,11 +317,12 @@ def create_tracker_entry(item, fonte_url, found_iso_date):
         r = requests.post(f"{NOTION_API}/pages", headers=NOTION_HEADERS_NEW, json=body, timeout=60)
         if r.status_code == 200:
             return "con template"
-        print(f"  [!] Template non applicato ({r.text[:150]}), riprovo senza.")
+        print(f"  [!] Template non applicato ({r.text[:200]}), riprovo senza.")
 
     body = {"parent": {"database_id": DB_TRACKER_ID}, "properties": props}
     r = requests.post(f"{NOTION_API}/pages", headers=NOTION_HEADERS, json=body, timeout=30)
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"Notion {r.status_code}: {r.text[:250]}")
     return "senza template"
 
 
@@ -299,6 +346,13 @@ def extract_text_from_html(html):
     return text.strip()
 
 
+BAD_LINK_RE = re.compile(
+    r"\.(png|jpe?g|gif|svg|pdf|zip|docx?|xlsx?|xml)(\?|$)|/feed|/atom|/rss|gateway/plugin|"
+    r"drive\.google\.com|facebook\.com|twitter\.com|x\.com/|linkedin\.com|instagram\.com|youtube\.com", re.I)
+INDEX_RE = re.compile(r"call|cfp|announce|avis|noticia|news|bando|convocat", re.I)
+_SEEN_PAGES = set()   # pagine gia' lette per la fonte corrente (evita doppioni)
+
+
 def extract_relevant_links(base_url, html, max_links=MAX_SUBLINKS_PER_FONTE):
     """Prima i link accanto a 'Call for Papers' (anche su altri domini, es. il sito
     del convegno), poi quelli dello stesso dominio con parole chiave utili."""
@@ -310,8 +364,8 @@ def extract_relevant_links(base_url, html, max_links=MAX_SUBLINKS_PER_FONTE):
         href = a["href"].strip()
         if href.startswith(("mailto:", "javascript:", "tel:", "#")):
             continue
-        abs_url = urljoin(base_url, href)
-        if urlparse(abs_url).scheme not in ("http", "https"):
+        abs_url = urljoin(base_url, href).split("#")[0]
+        if urlparse(abs_url).scheme not in ("http", "https") or BAD_LINK_RE.search(abs_url):
             continue
         if abs_url in seen or abs_url.rstrip("/") == base_url.rstrip("/"):
             continue
@@ -329,8 +383,30 @@ def extract_relevant_links(base_url, html, max_links=MAX_SUBLINKS_PER_FONTE):
     return (priority + normal)[:max_links]
 
 
+def content_links(base_url, html, limit=6):
+    """Link 'da articolo' dentro una pagina elenco (es. 'Avisos y call for papers' che
+    elenca solo i titoli delle singole call): ignora menu, header e footer."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["header", "nav", "footer", "aside", "script", "style"]):
+        t.decompose()
+    area = soup.find("main") or soup.find("article") or soup.find(class_=re.compile(r"entry-content|post-content|content", re.I)) or soup
+    domain = urlparse(base_url).netloc
+    out = []
+    for a in area.find_all("a", href=True):
+        label = a.get_text(" ", strip=True)
+        href = urljoin(base_url, a["href"]).split("#")[0]
+        if (len(label) < 12 or urlparse(href).netloc != domain or BAD_LINK_RE.search(href)
+                or href.rstrip("/") == base_url.rstrip("/") or href in out):
+            continue
+        out.append(href)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def fetch_source_text(url):
     main_html = fetch_html(url)
+    _SEEN_PAGES.add(url.rstrip("/"))
     main_text = extract_text_from_html(main_html)
     if len(main_text) < 400:
         print(f"  [!] Testo molto corto ({len(main_text)} caratteri): la pagina potrebbe "
@@ -341,13 +417,28 @@ def fetch_source_text(url):
     except Exception as e:
         print(f"  [!] Errore estraendo i link interni: {e}")
         sublinks = []
-    for link in sublinks:
+
+    queue, depth2 = [(l, 1) for l in sublinks], 0
+    while queue:
+        link, depth = queue.pop(0)
+        if link.rstrip("/") in _SEEN_PAGES:
+            continue
+        _SEEN_PAGES.add(link.rstrip("/"))
         try:
-            sub_text = extract_text_from_html(fetch_html(link))
-            combined += f"\n\n--- Pagina collegata: {link} ---\n{sub_text}"
+            sub_html = fetch_html(link)
+            combined += f"\n\n--- Pagina collegata: {link} ---\n{extract_text_from_html(sub_html)}"
             print(f"  (+) pagina collegata controllata: {link}")
         except Exception as e:
             print(f"  [!] Errore nel fetch di {link}: {e}")
+            continue
+        # se e' una pagina elenco di call/news, segue anche le singole voci
+        if depth == 1 and INDEX_RE.search(urlparse(link).path) and depth2 < 6:
+            for item_link in content_links(link, sub_html):
+                if depth2 >= 6:
+                    break
+                if item_link.rstrip("/") not in _SEEN_PAGES:
+                    queue.append((item_link, 2))
+                    depth2 += 1
     return combined
 
 
@@ -567,18 +658,19 @@ def gemini_request(payload):
     while _model_idx < len(GEMINI_MODELS):
         model = GEMINI_MODELS[_model_idx]
         resp = None
-        for attempt in range(3):
+        for attempt in range(2):
             resp = requests.post(gemini_url(model), json=payload, timeout=60)
             if resp.status_code not in (429, 500, 502, 503):
                 break
             quota_over = resp.status_code == 429 and ("limit: 0" in resp.text or "PerDay" in resp.text)
-            if quota_over or attempt == 2:
+            if quota_over or attempt == 1:
                 break
             m = re.search(r'"retryDelay":\s*"(\d+)', resp.text)
-            wait = min((int(m.group(1)) + 2) if m else 20, 45)
+            wait = min((int(m.group(1)) + 2) if m else 6, 30)
             print(f"  [!] Gemini occupato ({resp.status_code}), riprovo tra {wait}s...")
             time.sleep(wait)
-        if resp.status_code in (404, 429) or (resp.status_code == 400 and "model" in resp.text.lower()):
+        if (resp.status_code in (404, 429, 500, 502, 503)
+                or (resp.status_code == 400 and "model" in resp.text.lower())):
             print(f"  [!] Modello {model} non utilizzabile ({resp.status_code}): provo il successivo.")
             _model_idx += 1
             continue
@@ -684,6 +776,7 @@ def main():
             print(f"- {nome}: salto (Gemini non disponibile), riprovera' la prossima volta.")
             continue
 
+        _SEEN_PAGES.clear()
         print(f"- [{elapsed()}] {nome}: {len(urls)} indirizzo/i")
         parts = []  # (url, tipo, contenuto)
         for u in urls:
@@ -730,7 +823,8 @@ def main():
         for raw in found:
             item, why = finalize_item(raw)
             if not item:
-                print(f"  - scartata ({why}): {(raw.get('titolo') or '?')[:70]}")
+                print(f"  - scartata ({why}; scadenza={raw.get('scadenza')}, "
+                      f"evento={raw.get('data_evento')}): {(raw.get('titolo') or '?')[:70]}")
                 continue
             key = norm(item["titolo"])
             if key in seen_titles or tracker_exists(item, urls[0]):
