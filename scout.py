@@ -26,11 +26,17 @@ import re
 import sys
 import json
 import time
+import io
 import hashlib
 import datetime
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+
+try:
+    from pypdf import PdfReader  # per leggere le call pubblicate come PDF
+except Exception:
+    PdfReader = None
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -347,7 +353,7 @@ def extract_text_from_html(html):
 
 
 BAD_LINK_RE = re.compile(
-    r"\.(png|jpe?g|gif|svg|pdf|zip|docx?|xlsx?|xml)(\?|$)|/feed|/atom|/rss|gateway/plugin|"
+    r"\.(png|jpe?g|gif|svg|zip|docx?|xlsx?|xml)(\?|$)|/feed|/atom|/rss|gateway/plugin|"
     r"drive\.google\.com|facebook\.com|twitter\.com|x\.com/|linkedin\.com|instagram\.com|youtube\.com", re.I)
 INDEX_RE = re.compile(r"call|cfp|announce|avis|noticia|news|bando|convocat", re.I)
 _SEEN_PAGES = set()   # pagine gia' lette per la fonte corrente (evita doppioni)
@@ -372,6 +378,9 @@ def extract_relevant_links(base_url, html, max_links=MAX_SUBLINKS_PER_FONTE):
         label = a.get_text(" ", strip=True) or ""
         ctx = a.parent.get_text(" ", strip=True)[:300] if a.parent else label
         same_domain = urlparse(abs_url).netloc == base_domain
+        if is_pdf(abs_url) and not (CFP_CONTEXT_RE.search(ctx) or CFP_CONTEXT_RE.search(label)
+                                    or re.search(r"call|cfp|bando|convocat", abs_url + " " + label, re.I)):
+            continue
 
         if CFP_CONTEXT_RE.search(ctx) or CFP_CONTEXT_RE.search(label):
             seen.add(abs_url)
@@ -396,12 +405,69 @@ def content_links(base_url, html, limit=6):
         label = a.get_text(" ", strip=True)
         href = urljoin(base_url, a["href"]).split("#")[0]
         if (len(label) < 12 or urlparse(href).netloc != domain or BAD_LINK_RE.search(href)
-                or href.rstrip("/") == base_url.rstrip("/") or href in out):
+                or is_pdf(href) or href.rstrip("/") == base_url.rstrip("/") or href in out):
             continue
         out.append(href)
         if len(out) >= limit:
             break
     return out
+
+
+def is_pdf(url):
+    return bool(re.search(r"\.pdf(\?|$)", url, re.I))
+
+
+def fetch_pdf_text(url, max_pages=6):
+    if PdfReader is None:
+        raise RuntimeError("pypdf non installato (aggiungi 'pypdf' a requirements.txt)")
+    r = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+    r.raise_for_status()
+    if len(r.content) > 6_000_000:
+        raise RuntimeError("PDF troppo grande")
+    reader = PdfReader(io.BytesIO(r.content))
+    return "\n".join((pg.extract_text() or "") for pg in reader.pages[:max_pages])
+
+
+def pdf_links(base_url, html, limit=2):
+    """PDF che sembrano il testo di una call ('Download Call for Papers here')."""
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for a in soup.find_all("a", href=True):
+        href = urljoin(base_url, a["href"]).split("#")[0]
+        label = a.get_text(" ", strip=True)
+        if is_pdf(href) and href not in out and re.search(
+                r"call|cfp|download|descarg|scarica|bando|convocat|programme|program", href + " " + label, re.I):
+            out.append(href)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def main_text_from_html(html):
+    """Solo il contenuto principale (senza menu, header e footer): per le pagine dei singoli post."""
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript", "svg", "header", "nav", "footer", "aside"]):
+        t.decompose()
+    area = (soup.find("article") or soup.find("main")
+            or soup.find(class_=re.compile(r"entry-content|post-content", re.I)) or soup)
+    text = re.sub(r"\n{2,}", "\n", area.get_text(separator="\n"))
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def page_of(full_text, evidence, default=None):
+    """Da quale pagina collegata viene la frase che contiene la data (serve per il link giusto)."""
+    if not evidence:
+        return default
+    idx = full_text.lower().find(evidence.lower()[:40])
+    if idx < 0:
+        return default
+    last = default
+    for m in re.finditer(r"--- Pagina collegata: (\S+) ---", full_text):
+        if m.start() < idx:
+            last = m.group(1)
+        else:
+            break
+    return last
 
 
 def fetch_source_text(url):
@@ -418,20 +484,35 @@ def fetch_source_text(url):
         print(f"  [!] Errore estraendo i link interni: {e}")
         sublinks = []
 
-    queue, depth2 = [(l, 1) for l in sublinks], 0
+    queue, depth2, pdfs = [], 0, 0
+    # se la pagina indicata e' essa stessa un elenco di call (es. 'Avisos y call for papers'),
+    # segue per prime le singole voci
+    if INDEX_RE.search(urlparse(url).path):
+        for item_link in content_links(url, main_html):
+            queue.append((item_link, 2))
+            depth2 += 1
+    queue += [(l, 1) for l in sublinks]
+
     while queue:
         link, depth = queue.pop(0)
         if link.rstrip("/") in _SEEN_PAGES:
             continue
         _SEEN_PAGES.add(link.rstrip("/"))
         try:
+            if is_pdf(link):
+                if pdfs >= 3:
+                    continue
+                pdfs += 1
+                combined += f"\n\n--- Pagina collegata: {link} ---\n{fetch_pdf_text(link)}"
+                print(f"  (+) PDF letto: {link}")
+                continue
             sub_html = fetch_html(link)
             combined += f"\n\n--- Pagina collegata: {link} ---\n{extract_text_from_html(sub_html)}"
             print(f"  (+) pagina collegata controllata: {link}")
         except Exception as e:
             print(f"  [!] Errore nel fetch di {link}: {e}")
             continue
-        # se e' una pagina elenco di call/news, segue anche le singole voci
+        # pagina elenco di call/news: segue anche le singole voci
         if depth == 1 and INDEX_RE.search(urlparse(link).path) and depth2 < 6:
             for item_link in content_links(link, sub_html):
                 if depth2 >= 6:
@@ -439,6 +520,11 @@ def fetch_source_text(url):
                 if item_link.rstrip("/") not in _SEEN_PAGES:
                     queue.append((item_link, 2))
                     depth2 += 1
+        # la scadenza e' spesso solo nel PDF della call ("Download Call for Papers here")
+        if depth <= 2:
+            for pl in pdf_links(link, sub_html):
+                if pl.rstrip("/") not in _SEEN_PAGES:
+                    queue.append((pl, 3))
     return combined
 
 
@@ -577,26 +663,44 @@ def parse_philevents(url):
     return [i for i in items if RELEVANT_RE.search(i["_text"])]
 
 
-def fetch_listing_text(url):
-    """Aggregatori senza lettore dedicato (es. IASS): elenco compatto
-    'titolo | contesto | link', molto piu' leggibile per Gemini del testo grezzo."""
+POST_RE = re.compile(r"call|cfp|congress|conference|symposium|seminar|convocat|appel|contribution|workshop|school", re.I)
+
+
+def fetch_listing_text(url, max_posts=12):
+    """Aggregatori senza lettore dedicato (es. IASS): l'elenco mostra solo titolo ed estratto,
+    la scadenza sta nel post (o nel suo PDF). Quindi apre i post piu' recenti e legge quelli."""
     soup = BeautifulSoup(fetch_html(url), "html.parser")
     domain = urlparse(url).netloc
-    lines, seen = [], set()
+    posts, seen = [], set()
     for a in soup.find_all("a", href=True):
         title = a.get_text(" ", strip=True)
-        link = urljoin(url, a["href"])
-        if len(title) < 15 or link in seen or urlparse(link).netloc != domain:
+        link = urljoin(url, a["href"]).split("#")[0]
+        if (len(title) < 15 or link in seen or urlparse(link).netloc != domain
+                or BAD_LINK_RE.search(link) or is_pdf(link) or not POST_RE.search(title)
+                or any(x in link for x in ("/category/", "/page/", "/tag/", "/author/"))
+                or link.rstrip("/") == url.rstrip("/")):
             continue
         seen.add(link)
-        block = a.find_parent(["article", "li", "div"]) or a.parent
-        ctx = block.get_text(" ", strip=True)[:350] if block else ""
-        lines.append(f"- {title} | {ctx} | {link}")
-        if len(lines) >= 80:
+        posts.append((title, link))
+        if len(posts) >= max_posts:
             break
-    if not lines:
+    if not posts:
         print("  [!] Elenco vuoto: struttura della pagina non riconosciuta.")
-    return "\n".join(lines)
+    blocks = []
+    for title, link in posts:
+        try:
+            html = fetch_html(link)
+            body = main_text_from_html(html)[:3000]
+            blocks.append(f"--- Pagina collegata: {link} ---\n{title}\n{body}")
+            for pl in pdf_links(link, html, limit=1):
+                try:
+                    blocks.append(f"--- Pagina collegata: {pl} ---\n{fetch_pdf_text(pl)[:3000]}")
+                except Exception as e:
+                    print(f"  [!] PDF non letto ({pl}): {e}")
+        except Exception as e:
+            print(f"  [!] Errore nel fetch di {link}: {e}")
+    print(f"  Elenco: letti {len(blocks)} blocchi da {len(posts)} post")
+    return "\n\n".join(blocks)
 
 
 def fetch_any(url):
@@ -630,19 +734,26 @@ contenere molto rumore (menu, footer): concentrati solo su annunci di Call for P
 conferenze, summer school, workshop o seminari.
 
 REGOLE
-- Includi SOLO opportunita' con una data DEFINITA e futura. Scarta tutto cio' che e' TBA,
-  "to be announced", "coming soon", senza date o con date gia' passate.
-- "scadenza" = ultimo giorno per inviare abstract/paper (YYYY-MM-DD). Se non e'
-  indicata ma l'evento ha una data precisa, lasciala null e compila "data_evento".
+- Includi SOLO opportunita' con una data DEFINITA e futura, riferita ESPLICITAMENTE a quella
+  specifica call/evento nel testo. Scarta TBA, "to be announced", "coming soon", date mancanti o passate.
+- NON dedurre mai una data: ignora date generiche o ricorrenti ("di solito entro il 1 febbraio",
+  descrizioni di come funziona di norma un processo, FAQ), pagine su come candidarsi a ORGANIZZARE o
+  OSPITARE un convegno (co-chair, host), call per revisori/volontari/membri, premi, borse, grant,
+  iscrizioni all'associazione.
+- "evidenza" = la frase del testo che riporta la data, copiata TESTUALMENTE (max 200 caratteri,
+  senza puntini di sospensione). Se non riesci a copiare una frase che contiene la data, NON includere l'elemento.
+- "scadenza" = ultimo giorno per inviare abstract/paper (YYYY-MM-DD). Se non e' indicata ma
+  l'evento ha una data precisa, lasciala null e compila "data_evento".
 - "data_evento" = primo giorno dell'evento (YYYY-MM-DD) oppure null.
 - Se una data ha solo giorno e mese, scegli l'anno che la rende la prima data futura.
-- Se il tema e' solo parzialmente affine ai miei interessi, includila comunque: la
-  valutero' io. Escludi solo cio' che e' chiaramente lontano (es. medicina, ingegneria).
+- Le date possono essere in qualsiasi lingua (es. "15 de marzo de 2027", "15 mars 2027").
+- Se il tema e' solo parzialmente affine ai miei interessi, includila comunque: la valutero' io.
+  Escludi solo cio' che e' chiaramente lontano (es. medicina, ingegneria).
 - "link": URL diretto alla call se presente nel testo, altrimenti null.
 - Se non trovi nulla: {"trovate": []}
 
 Rispondi SOLO con JSON in questo formato (nessun testo fuori dal JSON):
-{"trovate": [{"titolo": "string breve", "tipo": "Journal CFP" | "Conferenza" | "Summer School" | "Evento gratuito online" | "Lezione/Seminario", "scadenza": "YYYY-MM-DD o null", "data_evento": "YYYY-MM-DD o null", "link": "URL o null", "note": "1-2 frasi in italiano su tema e rilevanza"}]}
+{"trovate": [{"titolo": "string breve", "tipo": "Journal CFP" | "Conferenza" | "Summer School" | "Evento gratuito online" | "Lezione/Seminario", "scadenza": "YYYY-MM-DD o null", "data_evento": "YYYY-MM-DD o null", "evidenza": "frase copiata dal testo", "link": "URL o null", "note": "1-2 frasi in italiano su tema e rilevanza"}]}
 
 TESTO DELLA PAGINA:
 __TESTO__
@@ -707,7 +818,15 @@ def ask_gemini(nome, url, text):
     data = gemini_request(payload)
     try:
         raw = data["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(raw).get("trovate", [])
+        res = json.loads(raw).get("trovate", [])
+        ntext = norm(text)
+        twords = set(ntext.split())
+        for it in res:
+            ev = norm(it.get("evidenza") or "")
+            ew = ev.split()
+            it["_verificata"] = bool(ev) and (
+                ev in ntext or (len(ew) >= 4 and sum(w in twords for w in ew) / len(ew) >= 0.85))
+        return res
     except (KeyError, IndexError, json.JSONDecodeError):
         raise RuntimeError(f"risposta di Gemini non interpretabile: {str(data)[:200]}")
 
@@ -725,6 +844,8 @@ def finalize_item(item):
     titolo = (item.get("titolo") or "").strip()
     if not titolo:
         return None, "senza titolo"
+    if item.get("_verificata") is False:
+        return None, "data non verificabile nel testo, forse dedotta"
     tipo = item.get("tipo") if item.get("tipo") in TIPO_OPZIONI else "Journal CFP"
     scad, evento = valid_date(item.get("scadenza")), valid_date(item.get("data_evento"))
     note = (item.get("note") or "").strip()
@@ -737,6 +858,9 @@ def finalize_item(item):
     else:
         return None, "senza data definita o gia' passata"
 
+    ev = (item.get("evidenza") or "").strip()
+    if ev:
+        note = (note + f" Data trovata in: «{ev[:160]}»").strip()
     out = dict(item, titolo=titolo, tipo=tipo, scadenza=data.isoformat(), note=note)
     return out, None
 
@@ -814,6 +938,9 @@ def main():
                 try:
                     res = ask_gemini(nome, u, chunk)
                     print(f"  {u} (parte {n}): Gemini ha trovato {len(res)} voci")
+                    for it in res:
+                        if not it.get("link"):
+                            it["link"] = page_of(payload, it.get("evidenza"), None)
                     found += res
                 except Exception as e:
                     all_ok = False
